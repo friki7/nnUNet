@@ -3,6 +3,7 @@ from nnunetv2.training.loss.dice import SoftDiceLoss, MemoryEfficientSoftDiceLos
 from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss, TopKLoss
 from nnunetv2.utilities.helpers import softmax_helper_dim1
 from torch import nn
+import torch.nn.functional as F
 
 
 class DC_and_CE_loss(nn.Module):
@@ -154,3 +155,91 @@ class DC_and_topk_loss(nn.Module):
 
         result = self.weight_ce * ce_loss + self.weight_dice * dc_loss
         return result
+        
+
+class ContrastiveLoss(nn.Module):
+    def __init__(self, temperature=0.1):
+        super(ContrastiveLoss, self).__init__()
+        self.temperature = temperature
+
+    def forward(self, feature_vectors, labels):
+        """
+        Compute NT-Xent Contrastive Loss
+        - feature_vectors: Tensor of shape (batch_size, num_features)
+        - labels: Binary labels (1 for airway, 0 for non-airway)
+        """
+        device = feature_vectors.device
+        batch_size = feature_vectors.shape[0]
+
+        # Normalize feature vectors
+        feature_vectors = F.normalize(feature_vectors, p=2, dim=1)
+
+        # Compute cosine similarity matrix
+        similarity_matrix = torch.matmul(feature_vectors, feature_vectors.T) / self.temperature
+
+        # Ensure labels are properly shaped
+        labels = labels.view(batch_size, 1)
+        label_matrix = torch.eq(labels, labels.T).float().to(device)
+
+        # Compute contrastive loss
+        loss = F.cross_entropy(similarity_matrix, label_matrix)
+        return loss
+
+
+class DC_CE_Contrastive_Loss(nn.Module):
+    def __init__(self, soft_dice_kwargs, ce_kwargs, contrastive_temp=0.1, weight_ce=1, weight_dice=1, weight_contrastive=0.5, ignore_label=None):
+        """
+        Combines Dice Loss + Cross-Entropy Loss + Contrastive Loss
+
+        :param soft_dice_kwargs: Dice Loss settings
+        :param ce_kwargs: Cross-Entropy settings
+        :param contrastive_temp: Temperature parameter for Contrastive Loss
+        :param weight_ce: Weight of Cross-Entropy Loss
+        :param weight_dice: Weight of Dice Loss
+        :param weight_contrastive: Weight of Contrastive Loss
+        :param ignore_label: Label to ignore in segmentation
+        """
+        super(DC_CE_Contrastive_Loss, self).__init__()
+        if ignore_label is not None:
+            ce_kwargs['ignore_index'] = ignore_label
+
+        self.weight_dice = weight_dice
+        self.weight_ce = weight_ce
+        self.weight_contrastive = weight_contrastive
+        self.ignore_label = ignore_label
+
+        self.ce = RobustCrossEntropyLoss(**ce_kwargs)
+        self.dc = SoftDiceLoss(apply_nonlin=softmax_helper_dim1, **soft_dice_kwargs)
+        self.contrastive = ContrastiveLoss(temperature=contrastive_temp)
+
+    def forward(self, net_output: torch.Tensor, target: torch.Tensor, feature_vectors: torch.Tensor):
+        """
+        Compute total loss: Dice Loss + Cross-Entropy Loss + Contrastive Loss
+
+        :param net_output: Segmentation output (B, C, X, Y, Z)
+        :param target: Ground truth labels (B, C, X, Y, Z)
+        :param feature_vectors: Extracted encoder features (B, num_features)
+        """
+        # Ensure target is correctly shaped
+        if target.ndim == 5:  # If target has batch & spatial dims
+            target_dice = target
+            target_ce = target[:, 0]
+        else:
+            target_dice = target.unsqueeze(1)  # Add a channel dimension if missing
+            target_ce = target
+
+        # Compute Dice and Cross-Entropy Loss
+        dc_loss = self.dc(net_output, target_dice) if self.weight_dice != 0 else 0
+        ce_loss = self.ce(net_output, target_ce) if self.weight_ce != 0 else 0
+
+        # Normalize feature vectors before contrastive loss
+        feature_vectors = F.normalize(feature_vectors, p=2, dim=1)
+
+        # Compute Contrastive Loss on feature vectors
+        contrastive_loss = self.contrastive(feature_vectors, target_ce) if self.weight_contrastive != 0 else 0
+
+        # Compute total loss
+        total_loss = self.weight_ce * ce_loss + self.weight_dice * dc_loss + self.weight_contrastive * contrastive_loss
+
+        return total_loss
+
